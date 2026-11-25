@@ -1,92 +1,95 @@
 # residential-wg-tunnel
 
-公网 Linux VPS 接收 TCP/UDP，经原生 WireGuard 把指定端口的流量交给 AT&T 家宽容器里的现有代理。容器主动建立隧道，代理认证、计费和互联网出站由原服务处理。
+[简体中文](README.zh-CN.md) · This English README is the authoritative documentation.
 
-## 适用环境
+A public Linux VPS accepts TCP and UDP connections on selected ports and relays them over native WireGuard to existing proxy services in an AT&T residential container. The container initiates the tunnel. The existing proxy handles authentication, traffic accounting, and internet egress.
 
-- 只需要公网 VPS 和家宽容器的 root 权限。两端需有 Linux、正在运行的 systemd、Python 3.9+、iproute2、wireguard-tools 和 nftables。
-- 家宽容器必须有创建原生 WireGuard 接口的权限。先运行 `check`，该命令会创建一个临时接口验证权限并删除它。若返回 `Operation not permitted` 或内核不支持 WireGuard，需服务商开放相应能力。
-- 公网地址应已配置在 VPS 上。IPv4 一对一 NAT 场景中，`public.ipv4` 填 VPS 实际绑定的本地地址，客户连接外部映射地址。IPv6 入口需要 VPS 具有可从外部到达的 IPv6。
-- 放行 VPS 上的 WireGuard UDP 端口和指定的业务端口。云防火墙或已有默认拒绝规则需要在对应的策略中授权这些端口。脚本新增独立 nftables 表，保留现有规则。也请核对家宽容器的防火墙允许隧道对端访问对应代理端口。
+## Requirements
 
-转发使用绑定 WireGuard 接口的 TCP/UDP 套接字，适用于全局 IPv6 转发关闭的 VPS。脚本保留默认路由、全局转发开关和现有代理配置。它只为两个隧道对端添加 IPv4 `/32` 和 IPv6 `/128` 路由。原生直连和已有 WARP 分流继续由家宽容器的现有出站策略决定。
+- Root access to the public VPS and the residential container is sufficient. Both need Linux, a running systemd, Python 3.9 or newer, iproute2, wireguard-tools, and nftables.
+- The residential container must be able to create a native WireGuard interface. The `check` command creates and removes a temporary interface to verify this capability. If it reports `Operation not permitted` or missing WireGuard support, ask the container provider to enable it.
+- The VPS must have the configured listener addresses assigned locally. With one-to-one IPv4 NAT, set `public.ipv4` to the address assigned on the VPS and have clients connect to the external mapped address. An IPv6 listener requires an IPv6 address reachable from the internet.
+- Allow the WireGuard UDP port and the selected service ports through the VPS cloud and host firewalls. Allow the tunnel peer to reach the proxy ports through any existing firewall in the residential container. The installer adds a dedicated nftables table and leaves existing rules in place.
 
-## 安装
+The relay binds its backend TCP and UDP sockets to the dedicated WireGuard interface. It works with global IPv6 forwarding disabled and leaves default routes, forwarding switches, and proxy configuration in place. It adds only IPv4 `/32` and IPv6 `/128` routes to the tunnel peer. Direct residential egress and any existing WARP routing still follow the container's routing policy.
 
-在两台机器上克隆私有仓库。请先让用于克隆的 GitHub 账号获得读取权限。
+## Installation
+
+Clone the repository on both machines.
 
 ```bash
-git clone git@github.com:maywind23/residential-wg-tunnel.git
+git clone https://github.com/maywind23/residential-wg-tunnel.git
 cd residential-wg-tunnel
 ```
 
-下列步骤假设使用默认实例。若同一台机器有多个部署，每条命令在子命令前加同一个 `--instance 名称`，同时选择独立的接口名和隧道地址。
+The commands below use the `default` instance. For multiple installations on the same machine, pass `--instance NAME` before the subcommand and give each instance its own interface name and tunnel addresses.
 
-### 1. 两端分别生成密钥
+### 1. Generate a key on each machine
 
-Debian 或 Ubuntu 可用 `install-deps` 安装缺少的工具。其他发行版使用自己的包管理器。
+On Debian or Ubuntu, `install-deps` installs missing dependencies. On other distributions, use the system package manager.
 
 ```bash
 sudo ./residential-wg-tunnel.sh install-deps
 sudo ./residential-wg-tunnel.sh keygen
 ```
 
-`keygen` 只打印公钥，重复执行会保留原密钥。私钥由 root 保存在本机的 `/etc/residential-wg-tunnel/<实例>/private.key`。只交换公钥。
+`keygen` prints only the public key and reuses the existing key on subsequent runs. The private key is stored locally at `/etc/residential-wg-tunnel/<instance>/private.key` with access restricted to root. Exchange only the public keys.
 
-### 2. 生成并填写 JSON
+### 2. Generate and edit the configurations
 
-在 VPS 上生成前置配置模板。
+On the VPS, generate the public relay configuration.
 
 ```bash
 ./residential-wg-tunnel.sh example vps > vps.json
 ```
 
-在家宽容器上生成对端配置模板。
+In the residential container, generate the peer configuration.
 
 ```bash
 ./residential-wg-tunnel.sh example home > home.json
 ```
 
-填写两端的 `peer.public_key`。VPS 的 `public` 填实际 IPv4/IPv6 监听地址，`wireguard_port` 填可用的 UDP 端口。家宽端 `peer.endpoint.host` 填 VPS 可达的公网 IP，端口填同一个 `wireguard_port`。默认保活为 25 秒。示例 IP 仅用于文档，隧道地址也要检查是否和现有网段重叠。
+Fill in `peer.public_key` on each side with the other machine's public key. On the VPS, set `public` to the IPv4 and/or IPv6 listener addresses and `wireguard_port` to a free UDP port. On the home side, set `peer.endpoint.host` to a reachable public IP of the VPS and use the same UDP port for `peer.endpoint.port`. The default keepalive interval is 25 seconds. Replace the example public IPs and check that the private tunnel addresses do not overlap with your existing networks.
 
-VPS 的每条 `ports` 配置包括：
+For each entry in the VPS `ports` array, configure the following fields.
 
-- `listen` 是公网端口，`target` 是家宽端的隧道端口，省略时与 `listen` 相同。
-- `protocols` 按原应用实际监听填 `["tcp"]`、`["udp"]` 或 `["tcp","udp"]`。
-- `target_family` 默认跟随公网入口。家宽代理只监听 IPv4 时可填 `"ipv4"`，保留 IPv6 公网入口。家宽应用访问目的地的地址族仍由原代理决定。
-- 转发后的连接源是隧道地址，后端看不到真实客户端 IP。已确认后端没有来源限制时填 `"source_policy":"none"`。存在来源规则时，在 VPS 用 `"source_policy":"acl"` 和 `allow`、`deny` CIDR 列表等效执行，拒绝列表优先。若原应用依赖真实源 IP 计数或限制会话，先保留该端口的原访问方式。
-- UDP 用 `udp_security: "authenticated"` 声明确认应用能认证自身的 UDP 流量，例如经过核实的 Shadowsocks 加密入站。使用 `"allowlist"` 时必须填写 `allow`。依赖 SOCKS5 UDP ASSOCIATE 返回地址或控制会话身份的端口，需要先处理该协议的协商规则。
+- `listen` is the public port. `target` is the home peer's tunnel port and defaults to `listen`.
+- `protocols` matches what the application actually listens on. Use `["tcp"]`, `["udp"]`, or `["tcp", "udp"]`.
+- `target_family` defaults to the public listener's address family. Set it to `"ipv4"` to reach an IPv4-only backend from an IPv6 listener. The backend still chooses the address family for its own outbound connections.
+- The proxy sees the relay's tunnel address as the connection source. Use `"source_policy": "none"` only after confirming that the backend has no source restrictions. To enforce existing source restrictions at the VPS, use `"source_policy": "acl"` with `allow` and `deny` CIDR lists. Deny rules take precedence. If the application requires the original client IP for accounting or session limits, keep that port on its existing ingress path.
+- For UDP, set `"udp_security": "authenticated"` only after verifying that the application authenticates its UDP traffic, such as a correctly configured Shadowsocks inbound. With `"udp_security": "allowlist"`, supply an `allow` list. Protocols that advertise a separate UDP endpoint or bind UDP to a control session, such as SOCKS5 UDP ASSOCIATE, require protocol-aware handling beyond port forwarding.
 
-家宽端的 `ports` 列出每个隧道监听端口和协议。应用已经监听通配或隧道地址时，家宽端直接把流量交给该监听。若服务只监听回环，可以使用一个空闲的隧道端口做回环映射，原服务继续绑定原地址。以下示例中，原 Snell 监听在回环端口 55485。
+In the home `ports` array, list each tunnel port and its protocols. If the service already listens on a wildcard or tunnel address, the relay can reach it directly. For a service bound to loopback, use a free tunnel port as a handoff. This example exposes a service listening on `127.0.0.1:30443` through tunnel port `31443`.
 
 ```json
 {
-  "listen": 35485,
+  "listen": 31443,
   "protocols": ["tcp", "udp"],
   "loopback": {
-    "ipv4": {"host": "127.0.0.1", "port": 55485},
-    "ipv6": {"host": "127.0.0.1", "port": 55485}
+    "ipv4": {"host": "127.0.0.1", "port": 30443},
+    "ipv6": {"host": "127.0.0.1", "port": 30443}
   }
 }
 ```
 
-此时对应的 VPS 映射写 `"listen":55485,"target":35485`。VPS 如果知道家宽 NAT 的固定出口，可用 `wireguard_sources` CIDR 列表限制 WireGuard 握手的来源。该字段只影响专用 WireGuard UDP 端口。
+Set `"listen": 30443, "target": 31443` in the corresponding VPS entry. If the residential NAT has a known, fixed egress address, `wireguard_sources` can restrict incoming handshakes to a list of CIDRs. This setting applies only to the dedicated WireGuard UDP port.
 
-### 3. 检查、启动并验证
+### 3. Check, install, and verify
 
-在两端使用各自的配置文件。建议先启动 VPS，再启动家宽端。
+Run these commands on the VPS first, then repeat them in the residential container with `home.json` in place of `vps.json`. The optional `validate` command checks the configuration without applying it. The root-only `check` command also checks local capabilities and available listeners.
 
 ```bash
+./residential-wg-tunnel.sh validate vps.json
 sudo ./residential-wg-tunnel.sh check vps.json
 sudo ./residential-wg-tunnel.sh install vps.json
 sudo ./residential-wg-tunnel.sh status
 ```
 
-家宽端把 `vps.json` 换成 `home.json`。若首次验收，先把 VPS 的 `listen` 设为空闲临时端口。用真实客户端从外部测试公共 IPv4 和 IPv6、原代理认证、TCP/UDP 以及目标网站看到的 IP。若节点有面板计数，核对原入站的计数。仅在临时入口测试停掉家宽端隧道后的断流和恢复。VPS 上的 TCP 监听可能仍接受握手，判据是代理请求不再完成。
+For the initial test, use an unused public `listen` port. From an external client, test public IPv4 and IPv6, proxy authentication, each configured transport, and the egress IP seen by the destination. If the proxy panel tracks usage, check that the original inbound records the traffic. On the temporary port, stop the tunnel on the home side and confirm that proxy requests fail, then start it and verify recovery. A VPS listener can still accept a TCP handshake while the home side is down.
 
-验收后把 VPS 的 `listen` 改为正式端口，用 `update` 应用。该操作只重启指定实例，会短暂停止这个实例的连接。如果新配置启动失败，安装器会恢复旧配置并尝试重新启动它。VPS 会保留最近一次 WireGuard 对端地址，以便同一对端在 VPS 服务重启后重新握手。
+After testing, set `listen` to the intended public port and run `update`. It briefly interrupts connections for that instance. If the new configuration fails to start, the installer restores the previous configuration and attempts to restart it. The VPS remembers the last authenticated WireGuard peer endpoint so it can reestablish the session with the same peer after a restart.
 
-## 日常操作和卸载
+## Management and uninstall
 
 ```bash
 sudo ./residential-wg-tunnel.sh status
@@ -96,14 +99,14 @@ sudo ./residential-wg-tunnel.sh update vps.json
 sudo ./residential-wg-tunnel.sh uninstall
 ```
 
-两端均可卸载。默认保留该实例的私钥以便重装，确定要移除密钥时使用 `uninstall --purge-key`。卸载只清理该实例的 unit、配置、接口和专属 nftables 表。此前手动添加的云防火墙策略和系统包由管理员管理。
+Use the local configuration file for `update`. Uninstall on each machine to remove that instance's systemd unit, configuration, interface, and dedicated nftables table. The key is retained for reinstallation by default. Use `uninstall --purge-key` to remove it. Cloud firewall changes and packages installed separately are managed outside the installer.
 
-可用下面的命令查看服务日志。
+View logs for the default instance with the following command.
 
 ```bash
 sudo journalctl -u residential-wg-tunnel-default.service -n 50
 ```
 
-## 隔离回归测试
+## Integration tests
 
-`sudo bash tests/integration.sh` 在支持网络命名空间和 systemd 的 Linux 上创建临时测试网络。测试覆盖真实 WireGuard、TCP/UDP 双栈、大包、ACL、回环后端、断流恢复、更新回滚和卸载。脚本使用独立的测试 unit 和端口，退出后清理测试网络。
+Run `sudo bash tests/integration.sh` on Linux with network namespace support and systemd. The suite creates an isolated test network and verifies native WireGuard, dual-stack TCP and UDP, large payloads, source ACLs, loopback handoff, recovery after a tunnel outage, update rollback, and uninstall. It uses temporary services, networks, and keys and cleans them up on exit.
