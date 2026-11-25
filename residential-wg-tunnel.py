@@ -287,8 +287,20 @@ def table_owner(table):
     result = cmd("nft", "-j", "list", "table", "inet", table, capture=True, check=False)
     if result.returncode:
         return None
-    return next((item["table"].get("comment", "") for item in json.loads(result.stdout)["nftables"]
-                 if "table" in item), "")
+    details = next((item["table"] for item in json.loads(result.stdout)["nftables"]
+                    if "table" in item), {})
+    if "comment" in details:
+        return details["comment"]
+
+    # nftables 1.0.6 omits table comments from JSON but includes them in text output.
+    result = cmd("nft", "list", "table", "inet", table, capture=True, check=False)
+    if result.returncode:
+        return None
+    header, _, body = result.stdout.partition("\n")
+    if header != f"table inet {table} {{":
+        return ""
+    comment = re.fullmatch(r'\s*comment "([^"\\]*)"\s*', body.partition("\n")[0])
+    return comment[1] if comment else ""
 
 
 def prefix(ip):
@@ -752,10 +764,13 @@ def update(paths, config):
     if not unit_owned(paths) or not paths.runner.is_file():
         raise ConfigError("No installed instance to update.")
     old_text = paths.config.read_text()
+    old_config = Configuration(json.loads(old_text))
     old_runner = paths.runner.read_text()
     inspect(config, paths, check_bind=False)
     cmd("systemctl", "stop", paths.unit_name)
     try:
+        # An older installed runner may leave its own firewall table behind on stop.
+        clean_network(old_config, paths)
         inspect(config, paths, check_bind=True)
         atomic(paths.config, payload(config))
         atomic(paths.runner, SCRIPT.read_text(), 0o700)
